@@ -2,14 +2,123 @@
 MongoDB database configuration and setup for Mergington High School API
 """
 
+import copy
+import os
+from typing import Any
+
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+
+class InMemoryResult:
+    def __init__(self, modified_count: int = 0):
+        self.modified_count = modified_count
+
+
+class InMemoryCollection:
+    def __init__(self):
+        self._documents: dict[str, dict[str, Any]] = {}
+
+    def count_documents(self, query: dict[str, Any]) -> int:
+        return sum(1 for document in self._documents.values() if _matches_query(document, query))
+
+    def insert_one(self, document: dict[str, Any]) -> None:
+        self._documents[document["_id"]] = copy.deepcopy(document)
+
+    def find(self, query: dict[str, Any]):
+        for document in self._documents.values():
+            if _matches_query(document, query):
+                yield copy.deepcopy(document)
+
+    def find_one(self, query: dict[str, Any]):
+        for document in self._documents.values():
+            if _matches_query(document, query):
+                return copy.deepcopy(document)
+        return None
+
+    def aggregate(self, pipeline: list[dict[str, Any]]):
+        days = set()
+        for document in self._documents.values():
+            for day in _get_nested_value(document, "schedule_details.days") or []:
+                days.add(day)
+        for day in sorted(days):
+            yield {"_id": day}
+
+    def update_one(self, query: dict[str, Any], update: dict[str, Any]) -> InMemoryResult:
+        for identifier, document in self._documents.items():
+            if not _matches_query(document, query):
+                continue
+
+            modified = 0
+            if "$push" in update:
+                for field, value in update["$push"].items():
+                    values = _get_nested_value(document, field)
+                    if isinstance(values, list):
+                        values.append(value)
+                        modified = 1
+            if "$pull" in update:
+                for field, value in update["$pull"].items():
+                    values = _get_nested_value(document, field)
+                    if isinstance(values, list) and value in values:
+                        values.remove(value)
+                        modified = 1
+
+            if modified:
+                self._documents[identifier] = document
+            return InMemoryResult(modified)
+
+        return InMemoryResult(0)
+
+
+def _get_nested_value(document: dict[str, Any], dotted_key: str):
+    value: Any = document
+    for part in dotted_key.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def _matches_query(document: dict[str, Any], query: dict[str, Any]) -> bool:
+    if not query:
+        return True
+
+    for key, expected in query.items():
+        actual = _get_nested_value(document, key)
+
+        if isinstance(expected, dict):
+            if "$in" in expected:
+                candidate_values = expected["$in"]
+                if isinstance(actual, list):
+                    if not any(item in actual for item in candidate_values):
+                        return False
+                elif actual not in candidate_values:
+                    return False
+            if "$gte" in expected and (actual is None or actual < expected["$gte"]):
+                return False
+            if "$lte" in expected and (actual is None or actual > expected["$lte"]):
+                return False
+        elif actual != expected:
+            return False
+
+    return True
+
+
+def _create_collections():
+    mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=1000)
+    client.admin.command("ping")
+    db = client["mergington_high"]
+    return client, db["activities"], db["teachers"]
+
+
+try:
+    client, activities_collection, teachers_collection = _create_collections()
+except PyMongoError:
+    client = None
+    activities_collection = InMemoryCollection()
+    teachers_collection = InMemoryCollection()
 
 # Methods
 
